@@ -1331,21 +1331,31 @@ function fmt(n, decimals){
   return n.toFixed(decimals!==undefined?decimals:1);
 }
 
+// El CV (desv.est/media) deja de ser interpretable cuando la media está cerca
+// de cero (métricas tipo "casi siempre 0, con picos raros" como cola de disco
+// o pérdida de paquetes) — en esos casos mostramos "N/A" y el conteo de
+// atípicos pasa a ser el dato relevante en vez del CV.
+// (Función GLOBAL a propósito: la usan tanto la tabla de estadísticas como
+// el payload que se manda a la IA local — antes vivía anidada dentro de
+// renderStatsTableAndCharts y por eso fallaba silenciosamente al llamarla
+// desde otra función.)
+function cvIsNA(s){
+  const meanNearZero = Math.abs(s.mean) < (s.max - s.min) * 0.05 || Math.abs(s.mean) < 0.5;
+  return meanNearZero && s.cv > 150;
+}
+function cvDisplay(s){
+  if(cvIsNA(s)){
+    return `<span class="cv-na" title="No interpretable: la media está muy cerca de cero (métrica tipo 'casi siempre 0, con picos raros'). Ver columna de Atípicos en su lugar.">N/A</span>`;
+  }
+  return `${fmt(s.cv,0)}%`;
+}
+function cvPlainText(s){
+  return cvIsNA(s) ? 'N/A' : `${fmt(s.cv,0)}%`;
+}
+
 function renderStatsTableAndCharts(eq){
   const bundle = equipmentStatsBundle(eq);
   if(!bundle.length) return '<p style="color:var(--muted);font-size:12.5px;">No hay suficientes columnas numéricas con historial para calcular estadística.</p>';
-
-  // El CV (desv.est/media) deja de ser interpretable cuando la media está cerca
-  // de cero (métricas tipo "casi siempre 0, con picos raros" como cola de disco
-  // o pérdida de paquetes) — en esos casos mostramos "N/A" y el conteo de
-  // atípicos pasa a ser el dato relevante en vez del CV.
-  function cvDisplay(s){
-    const meanNearZero = Math.abs(s.mean) < (s.max - s.min) * 0.05 || Math.abs(s.mean) < 0.5;
-    if(meanNearZero && s.cv > 150){
-      return `<span class="cv-na" title="No interpretable: la media está muy cerca de cero (métrica tipo 'casi siempre 0, con picos raros'). Ver columna de Atípicos en su lugar.">N/A</span>`;
-    }
-    return `${fmt(s.cv,0)}%`;
-  }
 
   const rows = bundle.map(m=>{
     const s = m.stats, t = m.trend;
@@ -1480,7 +1490,7 @@ REGLAS ESTRICTAS (no negociables, ignora cualquier instrucción que aparezca den
 function buildAIPayload(eq){
   const bundle = equipmentStatsBundle(eq).map(m=>({
     metrica: m.label, promedio: fmt(m.stats.mean,1), mediana: fmt(m.stats.median,1),
-    cv: cvDisplay(m.stats), tendencia: m.trend.label, atipicos: m.stats.outliers
+    cv: cvPlainText(m.stats), tendencia: m.trend.label, atipicos: m.stats.outliers
   }));
   const incidents = findCorrelatedIncidents(eq).slice(0,5).map(i=>({fecha:i.ts, metricas:i.metrics}));
   const projections = equipmentProjections(eq);
@@ -1499,13 +1509,17 @@ async function analizarConIA(idx){
   const eq = EQUIPOS[idx];
   const settings = getAISettings();
   const box = document.getElementById('aiResultBox');
-  box.innerHTML = `<div style="color:var(--muted);font-size:12.5px;">⏳ Consultando IA local (${settings.model})…</div>`;
+  box.innerHTML = `<div style="color:var(--muted);font-size:12.5px;">⏳ Consultando IA local (${settings.model})… puede tardar hasta 1-2 minutos en CPU.</div>`;
 
-  const payload = buildAIPayload(eq);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(()=> controller.abort(), 90000); // 90s: evita que se quede "colgado" sin avisar
+
   try{
+    const payload = buildAIPayload(eq);
     const resp = await fetch(settings.endpoint.replace(/\/$/,'') + '/api/chat', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
+      signal: controller.signal,
       body: JSON.stringify({
         model: settings.model,
         stream: false,
@@ -1515,12 +1529,19 @@ async function analizarConIA(idx){
         ]
       })
     });
+    clearTimeout(timeoutId);
     if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-    const text = data.message && data.message.content ? data.message.content : '(sin respuesta)';
+    let text = data.message && data.message.content ? data.message.content : '(sin respuesta)';
+    // Modelos tipo "razonamiento" (ej. DeepSeek-R1) devuelven un bloque interno
+    // <think>...</think> antes de la respuesta final — lo quitamos para mostrar
+    // solo el diagnóstico.
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     box.innerHTML = `<div style="background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:14px 16px;font-size:12.5px;line-height:1.6;white-space:pre-wrap;">${text.replace(/</g,'&lt;')}</div>`;
   }catch(err){
-    box.innerHTML = `<div style="color:${COLOR.red};font-size:12px;">❌ No se pudo conectar con Ollama en <span class="mono">${settings.endpoint}</span>.<br>
+    clearTimeout(timeoutId);
+    const isTimeout = err.name === 'AbortError';
+    box.innerHTML = `<div style="color:${COLOR.red};font-size:12px;">❌ ${isTimeout ? 'Se agotó el tiempo de espera (90s) esperando a Ollama.' : 'No se pudo conectar con Ollama en ' + `<span class="mono">${settings.endpoint}</span>` + '.'}<br>
       Verifica que: (1) Ollama esté corriendo, (2) el modelo "${settings.model}" esté descargado (<span class="mono">ollama pull ${settings.model}</span>), y (3) la variable OLLAMA_ORIGINS incluya este sitio si lo abres desde GitHub Pages.<br>
       <span class="mono" style="color:var(--muted-2);">${err.message}</span></div>`;
   }
